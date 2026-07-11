@@ -1,12 +1,8 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-using System.Collections.Concurrent;
-using System.Collections.ObjectModel;
-using System.Reflection;
-using System.Text.Json;
-using System.Diagnostics;
 using Avalonia;
+using Avalonia.Collections;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
@@ -17,6 +13,11 @@ using Avalonia.Threading;
 using Avalonia.VisualTree;
 using SharpEmu.Libs.Pad;
 using SharpEmu.Logging;
+using System.Collections.Concurrent;
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.Reflection;
+using System.Text.Json;
 
 namespace SharpEmu.GUI;
 
@@ -33,7 +34,8 @@ public partial class MainWindow : Window
 
     private readonly List<GameEntry> _allGames = new();
     private readonly ObservableCollection<GameEntry> _visibleGames = new();
-    private readonly ObservableCollection<LogLine> _consoleLines = new();
+    private readonly AvaloniaList<LogLine> _consoleLines = new();
+    private readonly List<LogLine> _allConsoleLines = new();
     private readonly ConcurrentQueue<(string Line, bool IsError)> _pendingLines = new();
     private readonly DispatcherTimer _consoleFlushTimer;
 
@@ -84,16 +86,20 @@ public partial class MainWindow : Window
         GameList.SelectionChanged += (_, _) => UpdateSelectedGame();
         GameList.DoubleTapped += (_, _) => LaunchSelected();
         SearchBox.TextChanged += (_, _) => RefreshVisibleGames();
+        ConsoleSearchBox.TextChanged += (_, _) => RefreshVisibleConsoleLines();
         AddFolderButton.Click += async (_, _) => await AddFolderAsync();
         EmptyAddFolderButton.Click += async (_, _) => await AddFolderAsync();
         RescanButton.Click += async (_, _) => await RescanLibraryAsync();
         OpenFileButton.Click += async (_, _) => await OpenFileAsync();
         LaunchButton.Click += (_, _) => LaunchSelected();
+        StopButton.Click += (_, _) => _emulator?.Stop();
+        ClearLogButton.Click += (_, _) => { _consoleLines.Clear(); _allConsoleLines.Clear(); };
         StopButton.Click += (_, _) => StopEmulator();
         ClearLogButton.Click += (_, _) => _consoleLines.Clear();
         CopyLogButton.Click += async (_, _) => await CopyConsoleAsync();
         OptionsToggle.IsCheckedChanged += (_, _) => OptionsPanel.IsVisible = OptionsToggle.IsChecked == true;
         ConsoleToggle.IsCheckedChanged += (_, _) => ConsolePanel.IsVisible = ConsoleToggle.IsChecked == true;
+        SelectLogFilePathButton.Click += async (_, _) => await SelectFilePathAsync();
         TitleMusicToggle.IsCheckedChanged += (_, _) => OnTitleMusicToggled();
         DiscordToggle.IsCheckedChanged += (_, _) =>
         {
@@ -323,7 +329,9 @@ public partial class MainWindow : Window
         TraceImportsBox.Value = Math.Clamp(_settings.ImportTraceLimit, 0, 4096);
         StrictToggle.IsChecked = _settings.StrictDynlibResolution;
         LogToFileToggle.IsChecked = _settings.LogToFile;
+        OverrideLogFileToggle.IsChecked = _settings.OverrideLogFile;
         TitleMusicToggle.IsChecked = _settings.PlayTitleMusic;
+        ToolTip.SetTip(SelectLogFilePathButton, string.IsNullOrWhiteSpace(_settings.LogFilePath) ? "No path selected" : _settings.LogFilePath);
         DiscordToggle.IsChecked = _settings.DiscordRichPresence;
     }
 
@@ -333,6 +341,7 @@ public partial class MainWindow : Window
         _settings.ImportTraceLimit = (int)(TraceImportsBox.Value ?? 0);
         _settings.StrictDynlibResolution = StrictToggle.IsChecked == true;
         _settings.LogToFile = LogToFileToggle.IsChecked == true;
+        _settings.OverrideLogFile = OverrideLogFileToggle.IsChecked == true;
         _settings.PlayTitleMusic = TitleMusicToggle.IsChecked == true;
         _settings.DiscordRichPresence = DiscordToggle.IsChecked == true;
     }
@@ -1028,16 +1037,51 @@ public partial class MainWindow : Window
         // Mirror everything the console pane shows into a log file for the
         // duration of the run, regardless of the emulator's log level.
         DropFileLog();
-        if (_settings.LogToFile && BuildLogFilePath(titleId) is { } logFilePath)
+        if (_settings.LogToFile)
         {
-            try
+            string filePath;
+            if (!string.IsNullOrWhiteSpace(_settings.LogFilePath))
             {
-                _fileLog = new StreamWriter(logFilePath, append: false);
-                AppendConsoleLine($"Log file: {logFilePath}", DimLineBrush);
+                if (_settings.OverrideLogFile)
+                {
+                    filePath = _settings.LogFilePath;
+                }
+                else
+                {
+                    string path = _settings.LogFilePath;
+                    string id = string.IsNullOrWhiteSpace(titleId) ? "UNKNOWN" : titleId;
+                    foreach (var invalidChar in Path.GetInvalidFileNameChars())
+                    {
+                        id = id.Replace(invalidChar.ToString(), "");
+                    }
+                    string identifier = $"{id}-{DateTime.Now:yyyyMMdd-HHmmss}";
+
+                    string? dir = Path.GetDirectoryName(path);
+                    string? fileName = Path.GetFileNameWithoutExtension(path);
+                    string? extension = Path.GetExtension(path);
+
+                    string newFileName = $"{fileName}-{identifier}{extension}";
+                    filePath = string.IsNullOrEmpty(dir)
+                        ? newFileName
+                        : Path.Combine(dir, newFileName);
+                }
             }
-            catch (Exception ex)
+            else
             {
-                AppendConsoleLine($"Could not open the log file: {ex.Message}", WarningLineBrush);
+                filePath = BuildLogFilePath(titleId) ?? string.Empty;
+            }
+
+            if (!string.IsNullOrEmpty(filePath))
+            {
+                try
+                {
+                    _fileLog = new StreamWriter(filePath, append: false);
+                    AppendConsoleLine($"Log file: {filePath}", DimLineBrush);
+                }
+                catch (Exception ex)
+                {
+                    AppendConsoleLine($"Could not open the log file: {ex.Message}", WarningLineBrush);
+                }
             }
         }
 
@@ -1162,6 +1206,27 @@ public partial class MainWindow : Window
         OpenFileButton.IsEnabled = !_isRunning;
     }
 
+    private async Task SelectFilePathAsync()
+    {
+        SaveFilePickerResult result = await StorageProvider.SaveFilePickerWithResultAsync(new FilePickerSaveOptions
+        {
+            Title = "Select where to save the Log file",
+            SuggestedFileName = "SharpEmuLog",
+            DefaultExtension = "log",
+            FileTypeChoices =
+                [
+                    new FilePickerFileType("Plain Text Files") { Patterns = ["*.txt"] },
+                    new FilePickerFileType("Log Files") { Patterns = ["*.log"] }
+                ]
+        });
+
+        if (result.File is not null)
+        {
+            _settings.LogFilePath = result.File.Path.LocalPath;
+            ToolTip.SetTip(SelectLogFilePathButton, _settings.LogFilePath);
+        }
+    }
+
     // ---- Console ----
 
     private void FlushPendingConsoleLines()
@@ -1180,26 +1245,27 @@ public partial class MainWindow : Window
 
         FlushFileLog();
 
-        if (incoming.Count >= MaxConsoleLines)
+        _allConsoleLines.AddRange(incoming);
+
+        string query = ConsoleSearchBox.Text ?? string.Empty;
+
+        IEnumerable<LogLine> linesToAdd = incoming;
+        if (!string.IsNullOrWhiteSpace(query))
         {
-            // A burst larger than the cap: keep only the newest lines.
-            _consoleLines.Clear();
-            for (var i = incoming.Count - MaxConsoleLines; i < incoming.Count; i++)
-            {
-                _consoleLines.Add(incoming[i]);
-            }
+            linesToAdd = incoming.Where(line =>
+                line.Text != null &&
+                line.Text.Contains(query, StringComparison.OrdinalIgnoreCase));
         }
-        else
+        _consoleLines.AddRange(linesToAdd);
+
+        var overflow = _consoleLines.Count - MaxConsoleLines;
+        while (_allConsoleLines.Count > MaxConsoleLines)
         {
-            var overflow = _consoleLines.Count + incoming.Count - MaxConsoleLines;
-            for (var i = 0; i < overflow; i++)
+            var droppedLine = _allConsoleLines[0];
+            _allConsoleLines.RemoveAt(0);
+            if (_consoleLines.Count > 0 && _consoleLines[0] == droppedLine)
             {
                 _consoleLines.RemoveAt(0);
-            }
-
-            foreach (var line in incoming)
-            {
-                _consoleLines.Add(line);
             }
         }
 
@@ -1210,9 +1276,48 @@ public partial class MainWindow : Window
     {
         WriteFileLog(text);
         FlushFileLog();
-        _consoleLines.Add(new LogLine(text, brush));
+
+        var line = new LogLine(text, brush);
+        _allConsoleLines.Add(line);
+
+        string query = ConsoleSearchBox.Text ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(query) || (text != null && text.Contains(query, StringComparison.OrdinalIgnoreCase)))
+        {
+            _consoleLines.Add(line);
+        }
+
+        while (_allConsoleLines.Count > MaxConsoleLines)
+        {
+            var droppedLine = _allConsoleLines[0];
+            _allConsoleLines.RemoveAt(0);
+            if (_consoleLines.Count > 0 && _consoleLines[0] == droppedLine)
+            {
+                _consoleLines.RemoveAt(0);
+            }
+        }
+
         _autoScrollTicks = 3;
         MaybeAutoScroll();
+    }
+
+    private void RefreshVisibleConsoleLines()
+    {
+        string query = ConsoleSearchBox.Text ?? string.Empty;
+
+        _consoleLines.Clear();
+
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            _consoleLines.AddRange(_allConsoleLines);
+        }
+        else
+        {
+            var filtered = _allConsoleLines.Where(line =>
+                line.Text != null &&
+                line.Text.Contains(query, StringComparison.OrdinalIgnoreCase));
+
+            _consoleLines.AddRange(filtered);
+        }
     }
 
     // ---- Console-to-file mirroring ----
