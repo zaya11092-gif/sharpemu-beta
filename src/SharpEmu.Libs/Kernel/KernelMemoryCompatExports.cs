@@ -96,6 +96,11 @@ public static partial class KernelMemoryCompatExports
     private static readonly Dictionary<int, FileStream> _openFiles = new();
     private static readonly Dictionary<int, OpenDirectory> _openDirectories = new();
     private static readonly object _libcAllocGate = new();
+    private static readonly object _hleIoGate = new();
+    private static readonly Dictionary<int, HleIoHandle> _hleIoHandles = new();
+    private static readonly Dictionary<uint, MutexState> _mutexes = new();
+    private static uint _nextMutexHandle = 1;
+    private static int _nextHleIoHandle = 1;
     private static readonly object _memoryGate = new();
     private static readonly object _ioTraceGate = new();
     private static readonly object _statCacheGate = new();
@@ -115,6 +120,221 @@ public static partial class KernelMemoryCompatExports
         lock (_fdGate)
         {
             return (int)Interlocked.Increment(ref _nextFileDescriptor);
+        }
+    }
+
+    private sealed class MutexState
+    {
+        public required string Name { get; init; }
+        public required object SyncRoot { get; init; }
+        public required bool Recursive { get; init; }
+        public int RecursionDepth { get; set; }
+        public int OwnerThreadId { get; set; }
+        public bool IsLocked { get; set; }
+    }
+
+    private sealed class HleIoHandle
+    {
+        public required string GuestPath { get; init; }
+        public required string HostPath { get; init; }
+        public required FileStream Stream { get; init; }
+        public long Position { get; set; }
+    }
+
+    [SysAbiExport(
+        Nid = "mxpKZ4Qf7As",
+        ExportName = "sceKernelCreateMutex",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int SceKernelCreateMutex(CpuContext ctx)
+    {
+        var mutexIdAddress = ctx[CpuRegister.Rdi];
+        var nameAddress = ctx[CpuRegister.Rsi];
+        var attr = unchecked((int)ctx[CpuRegister.Rdx]);
+        var initialLock = unchecked((int)ctx[CpuRegister.Rcx]);
+        var option = ctx[CpuRegister.R8];
+        if (mutexIdAddress == 0 || nameAddress == 0 || option != 0)
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!TryReadNullTerminatedUtf8(ctx, nameAddress, 128, out var name))
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        var handle = _nextMutexHandle++;
+        var state = new MutexState
+        {
+            Name = name,
+            SyncRoot = new object(),
+            Recursive = (attr & 0x2) != 0,
+            IsLocked = false,
+        };
+
+        lock (_hleIoGate)
+        {
+            _mutexes[handle] = state;
+        }
+
+        Span<byte> buffer = stackalloc byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer, handle);
+        if (!ctx.Memory.TryWrite(mutexIdAddress, buffer))
+        {
+            lock (_hleIoGate) { _ = _mutexes.Remove(handle); }
+            ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        Console.Error.WriteLine($"[LOADER][TRACE] mutex.create name='{name}' handle=0x{handle:X8} recursive={state.Recursive} initial={initialLock}");
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "uSRfd3J9k4V",
+        ExportName = "sceKernelLockMutex",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int SceKernelLockMutex(CpuContext ctx)
+    {
+        var handle = unchecked((uint)ctx[CpuRegister.Rdi]);
+        var timeout = unchecked((uint)ctx[CpuRegister.Rsi]);
+        if (handle == 0)
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!_mutexes.TryGetValue(handle, out var state))
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        Console.Error.WriteLine($"[LOADER][TRACE] mutex.lock name='{state.Name}' handle=0x{handle:X8} timeout={timeout}");
+        lock (state.SyncRoot)
+        {
+            if (!state.IsLocked || state.Recursive)
+            {
+                state.IsLocked = true;
+                state.OwnerThreadId = Environment.CurrentManagedThreadId;
+                state.RecursionDepth++;
+                ctx[CpuRegister.Rax] = 0;
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            if (timeout == 0)
+            {
+                ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+            }
+
+            Thread.SpinWait(16);
+        }
+
+        ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
+        return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
+    }
+
+    [SysAbiExport(
+        Nid = "SviKlOJOy8k",
+        ExportName = "sceIoOpen",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int SceIoOpen(CpuContext ctx)
+    {
+        var pathAddress = ctx[CpuRegister.Rdi];
+        var flags = unchecked((int)ctx[CpuRegister.Rsi]);
+        var mode = unchecked((int)ctx[CpuRegister.Rdx]);
+        if (pathAddress == 0 || !TryReadNullTerminatedUtf8(ctx, pathAddress, 1024, out var guestPath))
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        var hostPath = ResolveGuestPath(guestPath);
+        var fd = (int)Interlocked.Increment(ref _nextHleIoHandle);
+        try
+        {
+            var stream = new FileStream(hostPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            lock (_hleIoGate)
+            {
+                _hleIoHandles[fd] = new HleIoHandle
+                {
+                    GuestPath = guestPath,
+                    HostPath = hostPath,
+                    Stream = stream,
+                    Position = 0,
+                };
+            }
+
+            Console.Error.WriteLine($"[LOADER][TRACE] io.open guest='{guestPath}' host='{hostPath}' fd={fd} flags=0x{flags:X8} mode=0x{mode:X8}");
+            ctx[CpuRegister.Rax] = unchecked((ulong)fd);
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] io.open failed guest='{guestPath}' host='{hostPath}' ex={ex.GetType().Name}: {ex.Message}");
+            ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+    }
+
+    [SysAbiExport(
+        Nid = "0nD7vQdRj8P",
+        ExportName = "sceIoRead",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int SceIoRead(CpuContext ctx)
+    {
+        var fd = unchecked((int)ctx[CpuRegister.Rdi]);
+        var bufferAddress = ctx[CpuRegister.Rsi];
+        var requested = unchecked((int)ctx[CpuRegister.Rdx]);
+        if (fd <= 0 || requested < 0 || (requested > 0 && bufferAddress == 0))
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        HleIoHandle? handle;
+        lock (_hleIoGate)
+        {
+            _hleIoHandles.TryGetValue(fd, out handle);
+        }
+
+        if (handle is null)
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        if (requested == 0)
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        var rented = ArrayPool<byte>.Shared.Rent(requested);
+        try
+        {
+            var read = handle.Stream.Read(rented, 0, requested);
+            if (read > 0 && !ctx.Memory.TryWrite(bufferAddress, rented.AsSpan(0, read)))
+            {
+                ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
+            handle.Position += read;
+            Console.Error.WriteLine($"[LOADER][TRACE] io.read fd={fd} guest='{handle.GuestPath}' host='{handle.HostPath}' read={read} requested={requested}");
+            ctx[CpuRegister.Rax] = unchecked((ulong)read);
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
         }
     }
 
